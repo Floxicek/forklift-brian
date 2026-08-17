@@ -6,14 +6,14 @@ const ROLE_LABELS = { left: 'Left Motor', right: 'Right Motor', fork: 'Forklift'
 
 const SEATS = {
   red: [
-    { fwd: 'Q', back: 'A' },
-    { fwd: 'W', back: 'S' },
-    { fwd: 'E', back: 'D' },
+    { fwd: 'A', back: 'S' },
+    { fwd: 'L', back: ';' },
+    { fwd: '5', back: '6' },
   ],
   blue: [
-    { fwd: 'U', back: 'J' },
-    { fwd: 'I', back: 'K' },
-    { fwd: 'O', back: 'L' },
+    { fwd: 'Q', back: 'W' },
+    { fwd: 'O', back: 'P' },
+    { fwd: '8', back: '9' },
   ],
 };
 

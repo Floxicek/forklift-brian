@@ -19,7 +19,7 @@ sounds = [
 MOTOR_SPEED = 600
 FORK_MOTOR_SPEED = 1500
 
-show_image("assets/" + faces[0], size='fullscreen_fill')
+show_image("assets/" + faces[4], size='fullscreen_fill')
 
 set_wait_until_timeout_ms(300)
 
