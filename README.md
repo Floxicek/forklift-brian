@@ -65,10 +65,10 @@ persist to `config.json` so it's only needed once per venue.
   Brian devices are busy enough handling motor console commands during play
   and don't need the extra polling traffic.
 
-## Command protocol (browser → `main.py`)
+## Command protocol (browser → `main.py` → Brian console)
 
 Holding a key sends **one** command on press, and the matching stop command
-on release, as plain-text POST bodies to that team's `/api/motor/<team>`
+on release, as plain-text POST bodies to that team's `/api/console/<team>`
 endpoint on `main.py`. This is edge-triggered, not repeated while held.
 
 | Action                  | Command sent     |
@@ -84,51 +84,66 @@ endpoint on `main.py`. This is edge-triggered, not repeated while held.
 | Forklift stop            | `FORK_STOP`      |
 
 The nine strings above are the complete vocabulary `commandFor()` in
-`static/app.js` can produce. **`main.py` itself translates these directly
-into calls on the Brian's native motor REST API** (`POST
-/api/motor/{port}/autodetect` to register a handler, `POST
-/api/motor/{port}` with a body like `runAtSpeed(720)` or `brake()` to drive
-it) — no custom program needs to run on the Brian device for this. See
-`PORTS` / `SPEEDS_DEG_S` / `STOP_METHOD` / `MOTOR_COMMANDS` near the top of
-`main.py`.
+`static/app.js` can produce. `main.py` validates the command (against
+`VALID_COMMANDS`) and forwards it as-is, with a trailing `\n` appended
+(`send_console_command()`), to that team's device at `POST
+/api/program/console` — which feeds it to `brian-code/forklift.py`'s
+`input()` loop, running as the device's program. **All motor-specific
+logic (port wiring, speeds, Forward/Backward/Stop → `run_at_speed()` /
+`brake()` / `hold()`, `set_wait_until_timeout_ms()`) lives entirely in
+`forklift.py`, not `main.py`** — see that file for `PORTS` / motor speed
+constants / stop method per role.
 
-Because each port's Wi-Fi motor handler needs to see a motor instruction at
-least every `DEVICE_HANDLER_EXPIRY_S` = 15s or it's dropped, a background
-thread in `main.py` (`keepalive_loop`, every `KEEPALIVE_INTERVAL` = 5s)
-re-sends every registered motor's last known instruction (its last
-Forward/Backward/Stop, defaulting to Stop right after registration) — so a
-held key, or a motor just sitting idle, doesn't cause its handler to
-expire. `KEEPALIVE_INTERVAL` must stay under half of
-`DEVICE_HANDLER_EXPIRY_S` (enforced by an assert at import time): the loop
-only wakes up, and only re-checks "was this sent recently," once per
-interval, so a real command that lands just after one check can look
-"recent enough to skip" at the next check but still be up to ~2 intervals
-old by the check after that. At the old 10s/15s split that worst case
-(~20s) exceeded the expiry and the handler silently fell asleep after a
-burst of activity; 5s leaves a real margin.
+This requires `forklift.py` to actually be the program running on each
+Brian device — `main.py` handles that itself, automatically: a background
+watchdog thread (`deploy_watchdog_loop`, every `DEPLOY_CHECK_INTERVAL` =
+10s) checks each configured team's `GET /api/program/status`, and if it
+isn't `RUNNING` with `file` equal to `/forklift.py`, uploads the current
+`brian-code/forklift.py` via `PUT /api/sd/forklift.py` and starts it via
+`POST /api/program/run`. This covers the very first connection to a fresh
+device, the program having crashed, or it never having been started —
+without a manual upload step — but also means it will override *any* other
+program already running on that device the first time it's pointed at
+`main.py`, since this project's whole purpose for that device is running
+forklift.py. Unlike the motor-REST-API variant (see below), there's no
+separate registration/keepalive step needed once it's running, since a
+program's console just stays available for as long as the program itself
+is alive; there's no per-port Wi-Fi handler with its own expiry to defend
+against.
 
-Safety behavior: all 9 stop commands (3 roles × both teams... actually 3
-roles per team, sent per-team) are broadcast to both devices at every round
-rotation and whenever the browser tab loses focus, so nothing is ever left
-spinning under a role it's no longer assigned to.
+Safety behavior: all 9 stop commands (3 roles per team, sent per-team) are
+broadcast to both devices at every round rotation and whenever the browser
+tab loses focus, so nothing is ever left spinning under a role it's no
+longer assigned to.
 
-`brian-code/forklift.py` (a console-command-reading program meant to run on
-the device) is no longer needed for this flow — it's kept around from an
-earlier iteration of this project in case a console-based fallback is ever
-useful again, but `main.py` no longer talks to it.
+### Alternative: driving motors via the native REST API instead
+
+An earlier version of `main.py` (git commit "Using motor API") skipped
+`forklift.py` entirely and drove each motor directly via the Brian's own
+`/api/motor/{port}` endpoints from `main.py` itself — see that commit for
+the full implementation (port/speed/stop-method tables in `main.py`,
+`autodetect`-based handler registration, and a background keepalive thread
+re-sending each motor's last instruction so its Wi-Fi handler doesn't
+expire after 15s of silence). The two variants exist specifically to A/B
+real-world latency between talking to a custom on-device program's console
+vs. the firmware's own motor API directly; `git log`/`git show` that commit
+to compare.
 
 ## Architecture
 
 - **`main.py`** — Flask server. Serves the page and, per team (`red` /
   `blue`):
   - `GET /api/status/<team>` → proxies `GET {device}/api/status`
-  - `POST /api/motor/<team>` → parses one of the nine command strings above
-    and drives the device directly via its motor REST API (`POST
-    /api/motor/{port}/autodetect` + `POST /api/motor/{port}`), plus a
-    background thread that keeps every registered motor handler alive (see
-    "Command protocol" above)
+  - `POST /api/console/<team>` → validates one of the nine command strings
+    above and forwards it to `POST {device}/api/program/console`, feeding
+    `forklift.py`'s `input()` loop on the device (see "Command protocol"
+    above)
   - `GET/POST /api/config` → read/write `config.json` (device IPs + round
     length)
+
+  It also runs `deploy_watchdog_loop` in the background, which
+  auto-uploads and starts `forklift.py` on any configured device that
+  isn't already running it (see "Command protocol" above).
 
   Talking to the robots only through Flask means the browser never needs
   cross-origin requests (no CORS issues) and both device IPs live in one
@@ -150,9 +165,10 @@ useful again, but `main.py` no longer talks to it.
 - **`brian-code/`** — firmware-side Python that runs **on** a Brian device
   (a separate runtime from the Flask app above). `brian/` is the vendored
   Brian motor/sensor/runtime library, kept for reference/type-checking;
-  `forklift.py` is a console-command-reading program from an earlier
-  iteration of this project and isn't used by the current motor-REST-API
-  flow (see "Command protocol" above).
+  `forklift.py` is the program that must actually be running on each
+  device — it owns the `input()` loop, port wiring, speeds, and
+  Forward/Backward/Stop → motor-method dispatch (see "Command protocol"
+  above).
 
 ## Customization pointers
 
@@ -160,8 +176,8 @@ useful again, but `main.py` no longer talks to it.
   `ROLE_LABELS` at the top of `static/app.js`.
 - Command wording sent from the browser: `commandFor()` in
   `static/app.js`.
-- Motor port wiring, speeds, stop method (brake vs. hold): `PORTS` /
-  `SPEEDS_DEG_S` / `STOP_METHOD` near the top of `main.py`.
+- Motor port wiring, speeds, stop method (brake vs. hold),
+  `set_wait_until_timeout_ms()`: top of `brian-code/forklift.py`.
 - Default round length / device IP defaults: `DEFAULT_CONFIG` in
   `main.py`, or `config.json` directly.
 - Visual style (team colors, key size, centering, layout breakpoints):
@@ -182,49 +198,42 @@ useful again, but `main.py` no longer talks to it.
 - Role rotation state (`offsets` in `app.js`) is client-side only, not
   persisted, and resets on RESET — there is no server-side game state.
 - The settings panel auto-opens on load only if a device IP is missing.
-- Status/motor proxy timeouts are short on purpose (2s / 1.5s / 3s for
-  registration) so a dead/unreachable device never makes a key press feel
-  laggy; a failed call returns HTTP 502/503 with `{"online": false}` and
-  the UI shows "offline" rather than erroring.
-- `POST /api/motor/{port}/autodetect` returns `{"probe": ..., "handler":
-  ...|null}`; `_has_handler()` in `main.py` checks that field to confirm
-  registration actually produced a usable handler. That check is used only
-  for registration, not for the actual `runAtSpeed()`/`brake()`/`hold()`
-  invoke calls — those only care whether the request reached the device at
-  all. Re-checking `handler` there too was tried and caused *worse*
-  latency: a false "not registered" reading on an ordinary Stop call forced
-  the *next* real command to pay for a full `autodetect` round-trip (slow)
-  instead of just invoking the already-good handler (fast), which showed up
-  as random 0.2-2s spikes on individual key presses.
+- Status/command timeouts are short on purpose (2s / 1.5s) so a
+  dead/unreachable device never makes a key press feel laggy; a failed
+  call returns HTTP 502/503 with `{"online": false}` and the UI shows
+  "offline" rather than erroring.
 - `main.py` reuses one `requests.Session()` (`_http`) for every call to a
   device instead of opening a fresh connection per request — connection
   setup on Wi-Fi to a small embedded HTTP server is real, avoidable
-  overhead when it happens on every single motor command.
-- Retrying `autodetect` on every error at all (not just false negatives on
-  the invoke path above) was tried even earlier, in `brian-code/
-  forklift.py`'s history, and stalled the whole device under load — that's
-  why `ensure_handler()` only re-registers on an outright connection
-  failure.
-- Motor calls slower than `SLOW_CALL_LOG_THRESHOLD` (0.1s, in `main.py`)
-  print a `[slow] <port> <method>: <seconds>s` line to the server console.
-  This exists because there are two live theories for remaining per-command
-  latency spikes and no way to tell them apart without real numbers: (a)
-  every `Motor` method waits for the motor to report "ready," a wait we
-  used to cap with `set_wait_until_timeout_ms()` when driving motors from a
-  script — the REST API has no equivalent knob, so if the firmware's
-  default wait is long, that's invisible and uncontrollable from `main.py`;
-  or (b) Wi-Fi packet loss causing TCP retransmission backoff (200ms, 400ms,
-  800ms, 1.6s, ...), plausible in a room full of other robots' own Wi-Fi
-  access points on overlapping channels. If the logged spikes cluster at
-  specific durations, that points to (b); if they correlate with a motor
-  reversing direction or starting from idle, that points to (a).
+  overhead when it happens on every single command.
+- `forklift.py` calls `set_wait_until_timeout_ms()` once at import: every
+  `Motor` method (`run_at_speed`, `brake`, `hold`) otherwise waits
+  indefinitely for the motor to report "ready," and a missing/mis-wired
+  motor's first command would then block that whole `input()` loop (and
+  the device's HTTP server along with it) forever, with no way to recover
+  short of a reboot.
+- `forklift.py` connects each motor **once at startup**, not lazily per
+  command — retrying construction on every command for a genuinely
+  missing/wrong-port motor was tried and stalled the whole device under
+  load (autodetect can itself be slow). Its one `try`/`except` around the
+  whole command loop (`MotorException` logs and keeps going;
+  `KeyboardInterrupt` stops every connected motor and exits) replaced an
+  earlier nested-try version for the same reason: fewer places for the
+  two failure modes to interact unexpectedly.
+- Calls slower than `SLOW_CALL_LOG_THRESHOLD` (0.1s, in `main.py`) print a
+  `[slow] <team> console <command>: <seconds>s` line to the server
+  console, and an outright failed call prints `[disconnected]`/
+  `[connected]` on each state change — added specifically to turn "it got
+  disconnected"-style reports into a timeline (which team, what the actual
+  network exception was, when it recovered) instead of a guess.
 
 ## Appendix: Brian firmware REST API reference
 
 The full API the Brian firmware exposes (only `/api/status` and the
-`/api/motor/*` endpoints are currently used by this project; the rest is
-here for reference if this project grows to use more of it, e.g. file
-management or sensors).
+`/api/program/console` endpoints are currently used by this project's
+`main.py`; `/api/motor/*` is used by the alternative variant described
+under "Command protocol" above; the rest is here for reference if this
+project grows to use more of it, e.g. file management or sensors).
 
 ### File System Operations
 - `GET /api/sd` — list contents of root directory. Returns JSON array of

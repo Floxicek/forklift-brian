@@ -4,10 +4,16 @@ Brian robot control web app
 
 Simple Flask server that:
   * Serves the control web page (templates/index.html + static/app.js + static/style.css)
-  * Drives each team's Brian device directly over its native motor REST API
-    (no custom program needs to run on the device), so the browser never
+  * Proxies motor commands from the browser to each team's Brian device's
+    running console program (brian-code/forklift.py), so the browser never
     needs to talk cross-origin to the robots directly and the two device IP
     addresses live in one place (config.json).
+
+This is the console/custom-program variant, kept alongside the motor-REST-API
+variant (see git history, commit "Using motor API") specifically to compare
+real-world latency between the two approaches -- same HTTP-client fixes
+(session reuse, timing/connection logging) apply to both, only the transport
+to the device differs.
 
 Run (with uv):
     uv sync
@@ -32,12 +38,19 @@ import requests
 from flask import Flask, jsonify, render_template, request
 
 # A shared session reuses TCP connections per host (keep-alive) instead of
-# paying a fresh handshake on every single motor command -- meaningful
-# overhead on Wi-Fi to a small embedded HTTP server.
+# paying a fresh handshake on every single command -- meaningful overhead on
+# Wi-Fi to a small embedded HTTP server.
 _http = requests.Session()
 
 APP_DIR = Path(__file__).parent
 CONFIG_PATH = APP_DIR / "config.json"
+FORKLIFT_SOURCE = APP_DIR / "brian-code" / "forklift.py"
+
+# Path forklift.py is uploaded to and run from on the device's SD card.
+# GET /api/program/status's "file" field and POST /api/program/run's body
+# both use the leading-slash form; PUT /api/sd/{path} does not.
+PROGRAM_RUN_PATH = "/forklift.py"
+PROGRAM_SD_PATH = "forklift.py"
 
 app = Flask(__name__)
 
@@ -51,75 +64,37 @@ DEFAULT_CONFIG = {
 
 # Short timeouts so a dead/unreachable device never makes a key press feel
 # laggy. Status polling can tolerate a slightly longer timeout than
-# fire-and-forget motor commands.
+# fire-and-forget console commands. Uploading the program file and starting
+# it are rarer, one-off operations, so they get more slack.
 STATUS_TIMEOUT = 2.0
-MOTOR_TIMEOUT = 1.5
-REGISTER_TIMEOUT = 3.0
+COMMAND_TIMEOUT = 1.5
+DEPLOY_TIMEOUT = 5.0
+
+# How often the background watchdog checks whether each configured device
+# is actually running forklift.py, and (re)deploys it if not -- covers the
+# first-ever connection to a fresh device as well as the program having
+# crashed or never been started, without needing a manual upload step.
+DEPLOY_CHECK_INTERVAL = 10.0
 
 TEAMS = ("red", "blue")
 
-# Physical port wiring -- same on both robots. Adjust if a robot differs.
-PORTS = {"left": "B", "right": "C", "fork": "A"}
-
-SPEEDS_DEG_S = {"left": 720, "right": 720, "fork": 2020}
-
-# Wheels brake for a crisp stop; the fork holds position instead so it
-# doesn't sink under its own load once the key is released.
-STOP_METHOD = {"left": "brake()", "right": "brake()", "fork": "hold()"}
-
-MOTOR_COMMANDS = {
-    "LEFT_FORWARD": ("left", "Forward"),
-    "LEFT_BACKWARD": ("left", "Backward"),
-    "LEFT_STOP": ("left", "Stop"),
-    "RIGHT_FORWARD": ("right", "Forward"),
-    "RIGHT_BACKWARD": ("right", "Backward"),
-    "RIGHT_STOP": ("right", "Stop"),
-    "FORK_FORWARD": ("fork", "Forward"),
-    "FORK_BACKWARD": ("fork", "Backward"),
-    "FORK_STOP": ("fork", "Stop"),
-}
-
-# How often the background loop wakes up, AND the window used to decide a
-# role was "sent recently enough to skip." Both need to be this same value,
-# and it must be well under half of DEVICE_HANDLER_EXPIRY_S: worst case, a
-# real command lands just after one check, gets (correctly) treated as
-# recent at the next check one interval later, and isn't re-sent until the
-# check after *that* -- up to ~2x this interval after the real command. At
-# 10s that worst case (~20s) blew past the device's 15s expiry, which is
-# exactly why the handler was falling asleep after a burst of activity.
-KEEPALIVE_INTERVAL = 5.0
-DEVICE_HANDLER_EXPIRY_S = 15.0
-assert 2 * KEEPALIVE_INTERVAL < DEVICE_HANDLER_EXPIRY_S
-
-_motor_lock = threading.Lock()
-_registered = {team: {role: False for role in PORTS} for team in TEAMS}
-_last_command = {team: {role: None for role in PORTS} for team in TEAMS}
-_last_sent_at = {team: {role: 0.0 for role in PORTS} for team in TEAMS}
-
-
-def method_for(role, action):
-    if action == "Stop":
-        return STOP_METHOD[role]
-    speed = SPEEDS_DEG_S[role] if action == "Forward" else -SPEEDS_DEG_S[role]
-    return f"runAtSpeed({speed})"
-
-
-def _has_handler(resp):
-    # Both endpoints return {"probe": ..., "handler": ...|null} on success;
-    # an error response has no "handler" key at all, so .get() reads as
-    # None either way -- one check covers "device down", "no motor here",
-    # and "call failed" without needing to branch on status code.
-    try:
-        return resp.json().get("handler") is not None
-    except ValueError:
-        return False
-
+# The complete command vocabulary -- forklift.py on the device owns port
+# wiring, speeds, and Forward/Backward/Stop -> motor-method translation
+# entirely; main.py here only validates and forwards the text.
+VALID_COMMANDS = frozenset({
+    "LEFT_FORWARD", "LEFT_BACKWARD", "LEFT_STOP",
+    "RIGHT_FORWARD", "RIGHT_BACKWARD", "RIGHT_STOP",
+    "FORK_FORWARD", "FORK_BACKWARD", "FORK_STOP",
+})
 
 # Anything slower than this gets logged with a breakdown, so a slow command
-# shows up as data (which call was slow, how slow) instead of just a vague
-# "it feels slow" -- the two live hypotheses (device-side motor-readiness
-# wait vs. Wi-Fi packet loss/retransmission) need real numbers to tell apart.
+# shows up as data instead of just a vague "it feels slow".
 SLOW_CALL_LOG_THRESHOLD = 0.1
+
+_conn_lock = threading.Lock()
+# Assume online until proven otherwise, so the very first command to a team
+# doesn't print a spurious "disconnected" before we've ever heard from it.
+_team_online = {team: True for team in TEAMS}
 
 
 def _timed_post(url, **kwargs):
@@ -131,105 +106,85 @@ def _timed_post(url, **kwargs):
         return None, time.monotonic() - start, exc
 
 
-def _try_register(base, port, label):
-    resp, elapsed, exc = _timed_post(f"{base}/api/motor/{port}/autodetect", timeout=REGISTER_TIMEOUT)
-    if elapsed > SLOW_CALL_LOG_THRESHOLD:
-        print(f"[slow] {label} autodetect: {elapsed:.3f}s")
-    if exc is not None:
-        print(f"[unreachable] {label} autodetect: {exc}")
-        return False
-    return _has_handler(resp)
-
-
-def _invoke(base, port, method, label):
-    # Unlike registration, success here is just "the device took the
-    # request" -- we don't re-check the handler field, since we don't
-    # actually know it's guaranteed truthy after every Stop/brake() call,
-    # and treating a false negative there as "re-register" would force a
-    # slow autodetect round-trip before the next real command goes out.
+def send_console_command(team, base, command):
+    # input() on the Brian side only returns once it sees a newline -- the
+    # console POST body needs one appended, the device doesn't add it.
     resp, elapsed, exc = _timed_post(
-        f"{base}/api/motor/{port}",
-        data=method,
+        f"{base}/api/program/console",
+        data=command + "\n",
         headers={"Content-Type": "text/plain"},
-        timeout=MOTOR_TIMEOUT,
+        timeout=COMMAND_TIMEOUT,
     )
     if elapsed > SLOW_CALL_LOG_THRESHOLD:
-        print(f"[slow] {label} {method}: {elapsed:.3f}s")
-    if exc is not None:
-        print(f"[unreachable] {label} {method}: {exc}")
+        print(f"[slow] {team} console {command}: {elapsed:.3f}s")
+
+    ok = exc is None
+    with _conn_lock:
+        was_online = _team_online[team]
+        _team_online[team] = ok
+    if ok and not was_online:
+        print(f"[connected] {team}: console reachable again")
+    elif not ok and was_online:
+        print(f"[disconnected] {team}: {exc}")
+
+    return ok, resp
+
+
+def _is_forklift_running(base):
+    try:
+        resp = _http.get(f"{base}/api/program/status", timeout=STATUS_TIMEOUT)
+        resp.raise_for_status()
+        info = resp.json()
+    except (requests.RequestException, ValueError):
+        return None  # unreachable/unparseable -- distinct from "reachable but not running"
+    if info.get("status") != "RUNNING":
         return False
+    # Compare by basename, not exact string -- we don't actually know
+    # whether the device reports "file" with or without a leading slash
+    # (or some other path form), and a false mismatch here would make the
+    # watchdog repeatedly try to (re-)run an already-running program, which
+    # the firmware correctly rejects with 400 instead of being a no-op.
+    file = (info.get("file") or "").rstrip("/").split("/")[-1]
+    return file == PROGRAM_SD_PATH
+
+
+def deploy_forklift(team, base):
+    """Upload brian-code/forklift.py to the device's SD card and start it."""
+    try:
+        source = FORKLIFT_SOURCE.read_bytes()
+        put_resp = _http.put(
+            f"{base}/api/sd/{PROGRAM_SD_PATH}",
+            data=source,
+            headers={"Content-Type": "text/plain"},
+            timeout=DEPLOY_TIMEOUT,
+        )
+        put_resp.raise_for_status()
+        run_resp = _http.post(
+            f"{base}/api/program/run",
+            data=PROGRAM_RUN_PATH,
+            timeout=DEPLOY_TIMEOUT,
+        )
+        run_resp.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"[deploy] {team}: failed to upload/start {PROGRAM_RUN_PATH}: {exc}")
+        return False
+    print(f"[deploy] {team}: {PROGRAM_RUN_PATH} uploaded and running")
     return True
 
 
-def ensure_handler(base, team, role):
-    """Register the motor handler for a role if it isn't already, caching success."""
-    with _motor_lock:
-        if _registered[team][role]:
-            return True
-    label = f"{team}/{role}"
-    ok = _try_register(base, PORTS[role], label)
-    with _motor_lock:
-        _registered[team][role] = ok
-        if ok and _last_command[team][role] is None:
-            _last_command[team][role] = STOP_METHOD[role]
-    if ok:
-        print(f"[connected] {label}: handler registered")
-    return ok
-
-
-def send_motor_command(team, role, action):
-    ip = team_ip(team)
-    if not ip:
-        return False
-    base = base_url(ip)
-    if not ensure_handler(base, team, role):
-        return False
-    label = f"{team}/{role}"
-    method = method_for(role, action)
-    ok = _invoke(base, PORTS[role], method, label)
-    with _motor_lock:
-        if ok:
-            _last_command[team][role] = method
-            _last_sent_at[team][role] = time.monotonic()
-        else:
-            _registered[team][role] = False
-    if not ok:
-        print(f"[disconnected] {label}: lost while sending {method}")
-    return ok
-
-
-def keepalive_loop():
+def deploy_watchdog_loop():
     while True:
-        time.sleep(KEEPALIVE_INTERVAL)
-        now = time.monotonic()
         for team in TEAMS:
             ip = team_ip(team)
             if not ip:
                 continue
             base = base_url(ip)
-            for role, port in PORTS.items():
-                label = f"{team}/{role}"
-                with _motor_lock:
-                    registered = _registered[team][role]
-                if not registered:
-                    ensure_handler(base, team, role)
-                    continue
-                with _motor_lock:
-                    method = _last_command[team][role]
-                    sent_recently = (now - _last_sent_at[team][role]) < KEEPALIVE_INTERVAL
-                # Real gameplay traffic already resets the device's 15s
-                # handler-expiry clock -- sending a redundant keepalive on
-                # top of that only adds background load during exactly the
-                # moments the device is busiest.
-                if sent_recently or not method:
-                    continue
-                if _invoke(base, port, method, label):
-                    with _motor_lock:
-                        _last_sent_at[team][role] = time.monotonic()
-                else:
-                    with _motor_lock:
-                        _registered[team][role] = False
-                    print(f"[disconnected] {label}: lost during keepalive")
+            running = _is_forklift_running(base)
+            if running is False:
+                deploy_forklift(team, base)
+            # running is None (device unreachable right now) -- nothing to
+            # do, next tick will check again; running is True -- nothing to do.
+        time.sleep(DEPLOY_CHECK_INTERVAL)
 
 
 def load_config():
@@ -325,28 +280,27 @@ def proxy_status(team):
         return jsonify({"error": str(exc), "online": False}), 502
 
 
-@app.route("/api/motor/<team>", methods=["POST"])
-def proxy_motor_command(team):
+@app.route("/api/console/<team>", methods=["POST"])
+def proxy_console(team):
     team, err = _team_or_404(team)
     if err:
         return err
 
     body = (request.get_data(as_text=True) or "").strip()
-    mapping = MOTOR_COMMANDS.get(body)
-    if mapping is None:
+    if body not in VALID_COMMANDS:
         return jsonify({"error": f"unknown command {body!r}", "sent": body}), 400
 
-    if not team_ip(team):
+    ip = team_ip(team)
+    if not ip:
         return jsonify({"error": "no IP configured for this team", "online": False, "sent": body}), 503
 
-    role, action = mapping
-    ok = send_motor_command(team, role, action)
+    ok, resp = send_console_command(team, base_url(ip), body)
     if not ok:
         return jsonify({"ok": False, "online": False, "sent": body}), 502
-    return jsonify({"ok": True, "sent": body})
+    return jsonify({"ok": True, "status_code": resp.status_code, "sent": body})
 
 
-threading.Thread(target=keepalive_loop, daemon=True).start()
+threading.Thread(target=deploy_watchdog_loop, daemon=True).start()
 
 
 if __name__ == "__main__":

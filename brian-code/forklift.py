@@ -4,13 +4,6 @@ LEFT_MOTOR_SPEED = 720
 RIGHT_MOTOR_SPEED = 720
 FORK_MOTOR_SPEED = 720
 
-# Motor commands wait for the motor to be ready by default, with no time
-# limit unless one is set here. Without this, a missing/mis-wired motor can
-# block a command forever -- freezing this whole console loop (and the
-# device's HTTP server with it) until reboot.
-set_wait_until_timeout_ms(300)
-
-
 def make_motor(name, port):
     try:
         return Motor(port)

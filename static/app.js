@@ -79,7 +79,7 @@ for (const team of ['red', 'blue']) {
 function sendCommand(team, role, text) {
   const key = `${team}_${role}`;
   commandQueues[key] = commandQueues[key].then(() =>
-    fetch(`/api/motor/${team}`, {
+    fetch(`/api/console/${team}`, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: text,
