@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brian Robot Control</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+  <button id="settingsToggle" class="settings-toggle" title="Device settings">&#9881;</button>
+
+  <button id="playButton" class="play-toggle state-play" title="Start / reset">&#9654; PLAY</button>
+
+  <div id="settingsPanel" class="settings-panel hidden">
+    <h2>Device settings</h2>
+    <label>Red Brian IP / URL
+      <input type="text" id="redIpInput" placeholder="192.168.1.101">
+    </label>
+    <label>Blue Brian IP / URL
+      <input type="text" id="blueIpInput" placeholder="192.168.1.102">
+    </label>
+    <label>Round length (seconds)
+      <input type="number" id="roundSecondsInput" min="5" value="30">
+    </label>
+    <button id="saveSettings">Save</button>
+    <div id="settingsMsg" class="settings-msg"></div>
+  </div>
+
+  <div class="board not-started" id="board">
+
+    <section class="team-panel team-red" id="panel-red">
+      <h1 class="team-title">RED</h1>
+
+      <div class="status-box" id="status-red">
+        <span class="status-dot" id="dot-red"></span>
+        <span id="status-text-red">connecting…</span>
+      </div>
+
+      <div class="seats" id="seats-red"></div>
+    </section>
+
+    <section class="center-panel">
+      <div class="round-label">Round <span id="roundNumber">1</span></div>
+      <div class="timer" id="timer">30</div>
+      <div class="rotate-flash" id="rotateFlash">ROTATE!</div>
+    </section>
+
+    <section class="team-panel team-blue" id="panel-blue">
+      <h1 class="team-title">BLUE</h1>
+
+      <div class="status-box" id="status-blue">
+        <span class="status-dot" id="dot-blue"></span>
+        <span id="status-text-blue">connecting…</span>
+      </div>
+
+      <div class="seats" id="seats-blue"></div>
+    </section>
+
+  </div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

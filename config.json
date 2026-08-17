@@ -1,0 +1,9 @@
+{
+  "red": {
+    "ip": ""
+  },
+  "blue": {
+    "ip": ""
+  },
+  "round_seconds": 30
+}
