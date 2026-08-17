@@ -1,8 +1,27 @@
 from brian.motors import Motor, MotorPort, MotorException, set_wait_until_timeout_ms
+from brian.audio import play_tone
+from brian.runtime import show_image
+from brian.audio import play_file, stop_playback
 
-LEFT_MOTOR_SPEED = 720
-RIGHT_MOTOR_SPEED = 720
-FORK_MOTOR_SPEED = 720
+
+faces = ["gerty_empty.jpg",
+"gerty_confused_left.jpg",
+"gerty_love.jpg",
+"gerty_confused_right.jpg",
+"gerty_happy.jpg"]
+
+sounds = [
+    "assets/honk.wav",
+    "assets/engine.wav",
+    "assets/start.wav"
+]
+
+MOTOR_SPEED = 600
+FORK_MOTOR_SPEED = 1500
+
+show_image("assets/" + faces[0], size='fullscreen_fill')
+
+set_wait_until_timeout_ms(300)
 
 def make_motor(name, port):
     try:
@@ -15,6 +34,18 @@ def make_motor(name, port):
 left_motor = make_motor("left", MotorPort.B)
 right_motor = make_motor("right", MotorPort.C)
 fork_motor = make_motor("fork", MotorPort.A)
+
+def game_start():
+    show_image("assets/" + faces[1], size='fullscreen_fill')
+    play_file(sounds[1])
+
+def game_over():
+    show_image("assets/" + faces[2], size='fullscreen_fill')
+    play_tone(220, 600)
+
+def swapping_controls():
+    show_image("assets/" + faces[3], size='fullscreen_fill')
+    play_file(sounds[0])
 
 
 def stop_all():
@@ -34,15 +65,15 @@ while True:
             if not command:
                 continue
             if command == "LEFT_FORWARD" and left_motor:
-                left_motor.run_at_speed(LEFT_MOTOR_SPEED)
+                left_motor.run_at_speed(MOTOR_SPEED)
             elif command == "LEFT_BACKWARD" and left_motor:
-                left_motor.run_at_speed(-LEFT_MOTOR_SPEED)
+                left_motor.run_at_speed(-MOTOR_SPEED)
             elif command == "LEFT_STOP" and left_motor:
                 left_motor.brake()
             elif command == "RIGHT_FORWARD" and right_motor:
-                right_motor.run_at_speed(RIGHT_MOTOR_SPEED)
+                right_motor.run_at_speed(MOTOR_SPEED)
             elif command == "RIGHT_BACKWARD" and right_motor:
-                right_motor.run_at_speed(-RIGHT_MOTOR_SPEED)
+                right_motor.run_at_speed(-MOTOR_SPEED)
             elif command == "RIGHT_STOP" and right_motor:
                 right_motor.brake()
             elif command == "FORK_FORWARD" and fork_motor:
@@ -51,6 +82,12 @@ while True:
                 fork_motor.run_at_speed(-FORK_MOTOR_SPEED)
             elif command == "FORK_STOP" and fork_motor:
                 fork_motor.brake()
+            elif command == "GAME_START":
+                game_start()
+            elif command == "GAME_OVER":
+                game_over()
+            elif command == "SWAPPING_CONTROLS":
+                swapping_controls()
             elif command in (
                 "LEFT_FORWARD", "LEFT_BACKWARD", "LEFT_STOP",
                 "RIGHT_FORWARD", "RIGHT_BACKWARD", "RIGHT_STOP",

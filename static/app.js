@@ -20,6 +20,7 @@ const SEATS = {
 let roundSeconds = 30;
 let remaining = roundSeconds;
 let roundNumber = 1;
+let maxRounds = 6;
 let gameRunning = false;
 const offsets = { red: 0, blue: 0 };
 const pressedKeys = new Set(); // keys currently held, e.g. 'Q'
@@ -68,16 +69,19 @@ for (const team of ['red', 'blue']) {
 // Commands are queued per (team, role) -- not per team -- so Forward/Stop
 // for the *same* motor can never race out of order, but two different
 // motors (e.g. one seat driving, another running the forklift) fire fully
-// concurrently instead of waiting on each other's round trip.
+// concurrently instead of waiting on each other's round trip. Game-lifecycle
+// signals (start/over/swap) get their own queue slot per team, separate
+// from any motor's, since they're not tied to a specific role.
 const commandQueues = {};
 for (const team of ['red', 'blue']) {
   for (const role of ROLES) {
     commandQueues[`${team}_${role}`] = Promise.resolve();
   }
+  commandQueues[`${team}_signal`] = Promise.resolve();
 }
 
-function sendCommand(team, role, text) {
-  const key = `${team}_${role}`;
+function sendRaw(team, queueKey, text) {
+  const key = `${team}_${queueKey}`;
   commandQueues[key] = commandQueues[key].then(() =>
     fetch(`/api/console/${team}`, {
       method: 'POST',
@@ -85,6 +89,18 @@ function sendCommand(team, role, text) {
       body: text,
     }).catch(() => {})
   );
+}
+
+function sendCommand(team, role, text) {
+  sendRaw(team, role, text);
+}
+
+// GAME_START / GAME_OVER / SWAPPING_CONTROLS -- game-lifecycle signals
+// forklift.py reacts to (a tone) on both devices, not tied to any motor.
+function sendSignal(command) {
+  for (const team of ['red', 'blue']) {
+    sendRaw(team, 'signal', command);
+  }
 }
 
 function isTypingTarget(el) {
@@ -147,7 +163,9 @@ document.addEventListener('visibilitychange', () => {
 // ---- Timer / role rotation ----
 const timerEl = document.getElementById('timer');
 const roundNumberEl = document.getElementById('roundNumber');
+const maxRoundsLabelEl = document.getElementById('maxRoundsLabel');
 const rotateFlashEl = document.getElementById('rotateFlash');
+const gameOverFlashEl = document.getElementById('gameOverFlash');
 
 function renderTimer() {
   timerEl.textContent = remaining;
@@ -171,6 +189,8 @@ function rotateRoles() {
   roundNumber += 1;
   roundNumberEl.textContent = roundNumber;
 
+  sendSignal('SWAPPING_CONTROLS');
+
   rotateFlashEl.classList.add('show');
   setTimeout(() => rotateFlashEl.classList.remove('show'), 1200);
 }
@@ -183,6 +203,10 @@ function tick() {
     stopAllMotors();
     pressedKeys.clear();
     document.querySelectorAll('.key.pressed').forEach((el) => el.classList.remove('pressed'));
+    if (roundNumber >= maxRounds) {
+      endGame();
+      return;
+    }
     rotateRoles();
     remaining = roundSeconds;
   }
@@ -210,9 +234,15 @@ function startGame() {
   gameRunning = true;
   setRunningUI(true);
   startTimer();
+  sendSignal('GAME_START');
 }
 
-function resetGame() {
+// Shared cleanup for both a manual RESET and the automatic end-of-game at
+// maxRounds -- stops motors, clears keys/role rotation, and returns the UI
+// to the idle PLAY state. Sending GAME_OVER is the caller's job, since a
+// manual reset vs. reaching maxRounds want the signal sent at slightly
+// different points (immediately vs. before the game-over flash).
+function stopGameplay() {
   gameRunning = false;
   if (timerInterval) clearInterval(timerInterval);
   timerInterval = null;
@@ -231,11 +261,49 @@ function resetGame() {
   setRunningUI(false);
 }
 
+function resetGame() {
+  sendSignal('GAME_OVER');
+  stopGameplay();
+}
+
+// Reaching maxRounds ends the game automatically, distinct from a manual
+// RESET -- shows a brief "GAME OVER" flash so it's clear this was the
+// round limit being hit, not an operator aborting the game.
+function endGame() {
+  sendSignal('GAME_OVER');
+  stopGameplay();
+  gameOverFlashEl.classList.add('show');
+  setTimeout(() => gameOverFlashEl.classList.remove('show'), 2000);
+}
+
+const countdownOverlayEl = document.getElementById('countdownOverlay');
+const countdownNumberEl = document.getElementById('countdownNumber');
+const COUNTDOWN_SECONDS = 3;
+
+function startCountdownThenGame() {
+  playButton.disabled = true;
+  let n = COUNTDOWN_SECONDS;
+  countdownNumberEl.textContent = n;
+  countdownOverlayEl.classList.remove('hidden');
+
+  const countdownInterval = setInterval(() => {
+    n -= 1;
+    if (n > 0) {
+      countdownNumberEl.textContent = n;
+      return;
+    }
+    clearInterval(countdownInterval);
+    countdownOverlayEl.classList.add('hidden');
+    playButton.disabled = false;
+    startGame();
+  }, 1000);
+}
+
 playButton.addEventListener('click', () => {
   if (gameRunning) {
     resetGame();
   } else {
-    startGame();
+    startCountdownThenGame();
   }
 });
 
@@ -248,12 +316,19 @@ function renderStatus(team, data, ok) {
     text.textContent = 'offline';
     return;
   }
-  dot.className = 'status-dot online';
   const battery = typeof data.batteryPct === 'number' ? `${data.batteryPct}%` : '—';
   const charge = data.charging ? (data.chargingSlow ? ' (slow charge)' : ' (charging)') : '';
   const sd = data.sdCard || '—';
   const wifiClients = typeof data.wifiClients === 'number' ? data.wifiClients : '—';
-  text.textContent = `Batt ${battery}${charge} · SD ${sd} · WiFi clients ${wifiClients}`;
+  const info = `Batt ${battery}${charge} · SD ${sd} · WiFi clients ${wifiClients}`;
+
+  if (data.forkliftRunning === false) {
+    dot.className = 'status-dot error';
+    text.textContent = `⚠ forklift.py not running · ${info}`;
+  } else {
+    dot.className = 'status-dot online';
+    text.textContent = info;
+  }
 }
 
 async function pollStatus(team) {
@@ -284,6 +359,7 @@ const settingsPanel = document.getElementById('settingsPanel');
 const redIpInput = document.getElementById('redIpInput');
 const blueIpInput = document.getElementById('blueIpInput');
 const roundSecondsInput = document.getElementById('roundSecondsInput');
+const maxRoundsInput = document.getElementById('maxRoundsInput');
 const saveSettingsBtn = document.getElementById('saveSettings');
 const settingsMsg = document.getElementById('settingsMsg');
 
@@ -300,6 +376,9 @@ async function loadConfig() {
     roundSeconds = cfg.round_seconds || 30;
     remaining = roundSeconds;
     roundSecondsInput.value = roundSeconds;
+    maxRounds = cfg.max_rounds || 6;
+    maxRoundsInput.value = maxRounds;
+    maxRoundsLabelEl.textContent = maxRounds;
     renderTimer();
     const missingIp = !(cfg.red && cfg.red.ip) || !(cfg.blue && cfg.blue.ip);
     if (missingIp) {
@@ -319,11 +398,14 @@ saveSettingsBtn.addEventListener('click', async () => {
         red_ip: redIpInput.value.trim(),
         blue_ip: blueIpInput.value.trim(),
         round_seconds: parseInt(roundSecondsInput.value, 10) || 30,
+        max_rounds: parseInt(maxRoundsInput.value, 10) || 6,
       }),
     });
     const cfg = await resp.json();
     roundSeconds = cfg.round_seconds || 30;
     remaining = roundSeconds;
+    maxRounds = cfg.max_rounds || 6;
+    maxRoundsLabelEl.textContent = maxRounds;
     renderTimer();
     settingsMsg.textContent = 'Saved.';
     setTimeout(() => { settingsMsg.textContent = ''; }, 2000);

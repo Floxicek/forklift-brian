@@ -12,6 +12,10 @@
 
   <button id="playButton" class="play-toggle state-play" title="Start / reset">&#9654; PLAY</button>
 
+  <div class="countdown-overlay hidden" id="countdownOverlay">
+    <div class="countdown-number" id="countdownNumber">3</div>
+  </div>
+
   <div id="settingsPanel" class="settings-panel hidden">
     <h2>Device settings</h2>
     <label>Red Brian IP / URL
@@ -22,6 +26,9 @@
     </label>
     <label>Round length (seconds)
       <input type="number" id="roundSecondsInput" min="5" value="30">
+    </label>
+    <label>Max rounds
+      <input type="number" id="maxRoundsInput" min="1" value="6">
     </label>
     <button id="saveSettings">Save</button>
     <div id="settingsMsg" class="settings-msg"></div>
@@ -41,9 +48,10 @@
     </section>
 
     <section class="center-panel">
-      <div class="round-label">Round <span id="roundNumber">1</span></div>
+      <div class="round-label">Round <span id="roundNumber">1</span> / <span id="maxRoundsLabel">6</span></div>
       <div class="timer" id="timer">30</div>
       <div class="rotate-flash" id="rotateFlash">ROTATE!</div>
+      <div class="game-over-flash" id="gameOverFlash">GAME OVER</div>
     </section>
 
     <section class="team-panel team-blue" id="panel-blue">

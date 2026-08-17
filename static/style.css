@@ -166,6 +166,43 @@ html, body {
 }
 .rotate-flash.show { opacity: 1; }
 
+.game-over-flash {
+  position: absolute;
+  bottom: 20%;
+  font-size: 1.6rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: var(--red);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.game-over-flash.show { opacity: 1; }
+
+/* Countdown overlay */
+.countdown-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(12, 14, 20, 0.88);
+}
+.countdown-overlay.hidden { display: none; }
+
+.countdown-number {
+  font-size: 12rem;
+  font-weight: 800;
+  color: var(--key-pressed);
+  font-variant-numeric: tabular-nums;
+  animation: countdown-pulse 1s ease-out;
+}
+
+@keyframes countdown-pulse {
+  from { transform: scale(1.4); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
 /* Settings panel */
 .settings-toggle {
   position: fixed;

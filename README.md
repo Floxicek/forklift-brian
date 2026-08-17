@@ -51,13 +51,23 @@ persist to `config.json` so it's only needed once per venue.
 - **No on-screen role labels, on purpose.** The UI does not show which
   motor a seat currently controls. Figuring that out / communicating it
   within the team is intentionally part of the game.
+- **Max rounds ends the game automatically.** Configurable (default 6,
+  settings panel). When the round counter reaches it, the game ends the
+  same way a manual RESET does (motors stopped, roles/timer reset, back to
+  idle PLAY), but shows a brief "GAME OVER" flash first so it reads as the
+  round limit being hit rather than an operator aborting.
+- **3-2-1 countdown before a round starts.** Clicking PLAY doesn't
+  immediately arm the keys — it shows a full-screen 3-2-1 countdown first
+  (`COUNTDOWN_SECONDS` in `app.js`), then starts the round timer and arms
+  controls. The play/reset button is disabled for the duration so it can't
+  be double-clicked mid-countdown.
 - **Play / Reset toggle.** A pill button top-center starts idle, labeled
   "▶ PLAY", with all keys visually dimmed and totally inert (key presses are
-  ignored, nothing is sent anywhere). Clicking it starts the round timer and
-  arms the keys, and the button becomes "■ RESET" (red). Clicking it again
-  stops all motors, resets the round counter to 1, resets role rotation back
-  to the original assignment, and returns to the dimmed idle state — ready
-  for another PLAY.
+  ignored, nothing is sent anywhere). Clicking it runs the countdown above,
+  then arms the keys, and the button becomes "■ RESET" (red). Clicking it
+  again stops all motors, resets the round counter to 1, resets role
+  rotation back to the original assignment, and returns to the dimmed idle
+  state — ready for another PLAY.
 - **Status panels.** Each side shows battery %, charging state, SD card
   state, and Wi-Fi client count, or "offline" if the device doesn't respond.
   That team's `/api/status` is fetched once on page load and again whenever
@@ -83,33 +93,62 @@ endpoint on `main.py`. This is edge-triggered, not repeated while held.
 | Forklift backward        | `FORK_BACKWARD`  |
 | Forklift stop            | `FORK_STOP`      |
 
-The nine strings above are the complete vocabulary `commandFor()` in
-`static/app.js` can produce. `main.py` validates the command (against
-`VALID_COMMANDS`) and forwards it as-is, with a trailing `\n` appended
-(`send_console_command()`), to that team's device at `POST
-/api/program/console` — which feeds it to `brian-code/forklift.py`'s
-`input()` loop, running as the device's program. **All motor-specific
-logic (port wiring, speeds, Forward/Backward/Stop → `run_at_speed()` /
-`brake()` / `hold()`, `set_wait_until_timeout_ms()`) lives entirely in
-`forklift.py`, not `main.py`** — see that file for `PORTS` / motor speed
-constants / stop method per role.
+Three more strings are game-lifecycle signals rather than motor commands —
+sent once to *both* teams (`sendSignal()` in `app.js`, its own queue slot
+per team distinct from any motor's role queue), not edge-triggered per key:
+
+| Event                             | Command sent          |
+|------------------------------------|------------------------|
+| Round starts (after the countdown) | `GAME_START`           |
+| Game ends (manual RESET or maxRounds) | `GAME_OVER`         |
+| Roles rotate at a round boundary   | `SWAPPING_CONTROLS`   |
+
+`forklift.py` reacts to each with a distinct tone (`brian.audio.play_tone`,
+non-blocking) so both robots audibly signal these events themselves —
+consistent with the "no on-screen role labels" design, the *robot*
+announces a swap rather than the screen.
+
+`main.py` validates every command (against `VALID_COMMANDS`) and forwards
+it as-is, with a trailing `\n` appended (`send_console_command()`), to
+that team's device at `POST /api/program/console` — which feeds it to
+`brian-code/forklift.py`'s `input()` loop, running as the device's
+program. **All motor-specific logic (port wiring, speeds,
+Forward/Backward/Stop → `run_at_speed()` / `brake()` / `hold()`,
+`set_wait_until_timeout_ms()`) lives entirely in `forklift.py`, not
+`main.py`** — see that file for `PORTS` / motor speed constants / stop
+method per role.
 
 This requires `forklift.py` to actually be the program running on each
-Brian device — `main.py` handles that itself, automatically: a background
+Brian device — `main.py` handles most of that automatically: a background
 watchdog thread (`deploy_watchdog_loop`, every `DEPLOY_CHECK_INTERVAL` =
 10s) checks each configured team's `GET /api/program/status`, and if it
-isn't `RUNNING` with `file` equal to `/forklift.py`, uploads the current
-`brian-code/forklift.py` via `PUT /api/sd/forklift.py` and starts it via
-`POST /api/program/run`. This covers the very first connection to a fresh
-device, the program having crashed, or it never having been started —
-without a manual upload step — but also means it will override *any* other
-program already running on that device the first time it's pointed at
-`main.py`, since this project's whole purpose for that device is running
-forklift.py. Unlike the motor-REST-API variant (see below), there's no
-separate registration/keepalive step needed once it's running, since a
-program's console just stays available for as long as the program itself
-is alive; there's no per-port Wi-Fi handler with its own expiry to defend
-against.
+isn't `RUNNING` with `file` matching `/forklift.py`, uploads the current
+`brian-code/forklift.py` via `PUT /api/sd/forklift.py`.
+
+**`POST /api/program/run` does not work on this firmware build** — it
+returns `400 "No program provided"` no matter what's sent as the body
+(confirmed with raw `curl`: JSON, form-encoded, multipart, query params,
+VFS-style paths, even a genuinely empty body all give the identical
+error). So instead of calling it, `deploy_forklift()` sets
+`defaultProgramPath=/forklift.py` and `shouldRunDefaultOnBoot=true` via
+`POST /api/settings`, and the device launches it on its own next boot.
+There's no REST endpoint to trigger a reboot remotely, so **each device
+needs one manual power-cycle** after this runs for the first time — after
+that boot, it's permanent (survives `main.py` restarts, since it's the
+device's own setting) unless the setting is changed again.
+
+This also means the watchdog will override *any* other program already
+configured to run on that device the first time it's pointed at `main.py`,
+since this project's whole purpose for that device is running forklift.py.
+Unlike the motor-REST-API variant (see below), there's no separate
+registration/keepalive step needed once it's running, since a program's
+console just stays available for as long as the program itself is alive;
+there's no per-port Wi-Fi handler with its own expiry to defend against.
+
+The status panel shows `⚠ forklift.py not running` (and a red status dot)
+whenever `GET /api/program/status` doesn't report forklift.py as the
+running program — the most common reason is exactly this: waiting on that
+one-time manual power-cycle.
 
 Safety behavior: all 9 stop commands (3 roles per team, sent per-team) are
 broadcast to both devices at every round rotation and whenever the browser
@@ -142,8 +181,9 @@ to compare.
     length)
 
   It also runs `deploy_watchdog_loop` in the background, which
-  auto-uploads and starts `forklift.py` on any configured device that
-  isn't already running it (see "Command protocol" above).
+  auto-uploads `forklift.py` and configures it to auto-run on boot for any
+  configured device that isn't already running it (see "Command protocol"
+  above — this still needs one manual power-cycle per device).
 
   Talking to the robots only through Flask means the browser never needs
   cross-origin requests (no CORS issues) and both device IPs live in one

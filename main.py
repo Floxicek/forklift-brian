@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "red": {"ip": ""},
     "blue": {"ip": ""},
     "round_seconds": 30,
+    "max_rounds": 6,
 }
 
 # Short timeouts so a dead/unreachable device never makes a key press feel
@@ -80,11 +81,14 @@ TEAMS = ("red", "blue")
 
 # The complete command vocabulary -- forklift.py on the device owns port
 # wiring, speeds, and Forward/Backward/Stop -> motor-method translation
-# entirely; main.py here only validates and forwards the text.
+# entirely; main.py here only validates and forwards the text. GAME_START /
+# GAME_OVER / SWAPPING_CONTROLS are game-lifecycle signals (not tied to a
+# motor) that trigger a tone on the device via forklift.py.
 VALID_COMMANDS = frozenset({
     "LEFT_FORWARD", "LEFT_BACKWARD", "LEFT_STOP",
     "RIGHT_FORWARD", "RIGHT_BACKWARD", "RIGHT_STOP",
     "FORK_FORWARD", "FORK_BACKWARD", "FORK_STOP",
+    "GAME_START", "GAME_OVER", "SWAPPING_CONTROLS",
 })
 
 # Anything slower than this gets logged with a breakdown, so a slow command
@@ -149,7 +153,18 @@ def _is_forklift_running(base):
 
 
 def deploy_forklift(team, base):
-    """Upload brian-code/forklift.py to the device's SD card and start it."""
+    """Upload brian-code/forklift.py and set it to auto-run on boot.
+
+    POST /api/program/run reliably returns 400 "No program provided" on
+    this firmware build regardless of body format -- confirmed with raw
+    curl testing (JSON, form-encoded, multipart, query params, VFS-style
+    paths, even a genuinely empty body all produce the identical error),
+    so it isn't something this client can work around. Instead: upload the
+    file, then set defaultProgramPath + shouldRunDefaultOnBoot so the
+    device launches it on its own boot sequence. There's no REST endpoint
+    to trigger a reboot remotely, so this still needs one manual
+    power-cycle per device the first time -- after that it's permanent.
+    """
     try:
         source = FORKLIFT_SOURCE.read_bytes()
         put_resp = _http.put(
@@ -159,16 +174,20 @@ def deploy_forklift(team, base):
             timeout=DEPLOY_TIMEOUT,
         )
         put_resp.raise_for_status()
-        run_resp = _http.post(
-            f"{base}/api/program/run",
-            data=PROGRAM_RUN_PATH,
+        settings_resp = _http.post(
+            f"{base}/api/settings",
+            data=f"defaultProgramPath={PROGRAM_RUN_PATH}\nshouldRunDefaultOnBoot=true",
+            headers={"Content-Type": "text/plain"},
             timeout=DEPLOY_TIMEOUT,
         )
-        run_resp.raise_for_status()
+        settings_resp.raise_for_status()
     except requests.RequestException as exc:
-        print(f"[deploy] {team}: failed to upload/start {PROGRAM_RUN_PATH}: {exc}")
+        print(f"[deploy] {team}: failed to upload/configure {PROGRAM_RUN_PATH}: {exc}")
         return False
-    print(f"[deploy] {team}: {PROGRAM_RUN_PATH} uploaded and running")
+    print(
+        f"[deploy] {team}: {PROGRAM_RUN_PATH} uploaded and set to auto-run on "
+        "boot -- power-cycle this device once to start it"
+    )
     return True
 
 
@@ -250,6 +269,11 @@ def update_config():
                 _config["round_seconds"] = max(5, int(payload["round_seconds"]))
             except (TypeError, ValueError):
                 pass
+        if "max_rounds" in payload:
+            try:
+                _config["max_rounds"] = max(1, int(payload["max_rounds"]))
+            except (TypeError, ValueError):
+                pass
         save_config(_config)
         return jsonify(_config)
 
@@ -275,6 +299,7 @@ def proxy_status(team):
         resp.raise_for_status()
         data = resp.json()
         data["online"] = True
+        data["forkliftRunning"] = _is_forklift_running(base_url(ip))
         return jsonify(data)
     except requests.RequestException as exc:
         return jsonify({"error": str(exc), "online": False}), 502
