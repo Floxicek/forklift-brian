@@ -29,8 +29,8 @@ function roleForSeat(team, seatIndex) {
 }
 
 function commandFor(role, dir) {
-  // dir: 'Forward' | 'Backward' | 'Stop'  ->  e.g. "leftForward", "forkStop"
-  return `${role}${dir}`;
+  // dir: 'Forward' | 'Backward' | 'Stop'  ->  e.g. "LEFT_FORWARD", "FORK_STOP"
+  return `${role.toUpperCase()}_${dir.toUpperCase()}`;
 }
 
 function buildSeatsUI() {
@@ -65,12 +65,22 @@ for (const team of ['red', 'blue']) {
   });
 }
 
+// Each team's commands are sent one at a time, in order -- the Brian's HTTP
+// server handles one connection cleanly; firing several requests at once
+// (e.g. from quick key-mashing) makes it appear to hang/lag instead.
+const commandQueues = { red: Promise.resolve(), blue: Promise.resolve() };
+
 function sendCommand(team, text) {
-  fetch(`/api/console/${team}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: text,
-  }).catch(() => {});
+  // input() on the Brian side only returns once it sees a newline -- without
+  // one, commands from separate POSTs pile up in the same input() call.
+  const body = text + '\n';
+  commandQueues[team] = commandQueues[team].then(() =>
+    fetch(`/api/console/${team}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body,
+    }).catch(() => {})
+  );
 }
 
 function isTypingTarget(el) {
@@ -244,13 +254,16 @@ async function pollStatus(team) {
   }
 }
 
+// Status is polled on a slow 5s interval, not more often -- the Brian
+// devices are busy enough handling motor console commands during play, and
+// battery/SD/Wi-Fi info doesn't need to be any fresher than that.
 function startStatusPolling() {
   pollStatus('red');
   pollStatus('blue');
   setInterval(() => {
     pollStatus('red');
     pollStatus('blue');
-  }, 2000);
+  }, 5000);
 }
 
 // ---- Settings panel ----

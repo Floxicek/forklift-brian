@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "bricode",
+      "name": "BriCode: Upload and Run (Wi-Fi)",
+      "request": "launch",
+      "program": "${file}",
+      "runAfterUpload": true,
+      "streamConsole": true,
+      "transport": "wifi"
+    },
+    {
+      "type": "bricode",
+      "name": "BriCode: Upload (Wi-Fi)",
+      "request": "launch",
+      "program": "${file}",
+      "runAfterUpload": false,
+      "streamConsole": false,
+      "transport": "wifi"
+    },
+    {
+      "type": "bricode",
+      "name": "BriCode: Upload via Cable",
+      "request": "launch",
+      "program": "${file}",
+      "runAfterUpload": false,
+      "streamConsole": false,
+      "transport": "usb"
+    }
+  ]
+}
