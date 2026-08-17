@@ -65,20 +65,24 @@ for (const team of ['red', 'blue']) {
   });
 }
 
-// Each team's commands are sent one at a time, in order -- the Brian's HTTP
-// server handles one connection cleanly; firing several requests at once
-// (e.g. from quick key-mashing) makes it appear to hang/lag instead.
-const commandQueues = { red: Promise.resolve(), blue: Promise.resolve() };
+// Commands are queued per (team, role) -- not per team -- so Forward/Stop
+// for the *same* motor can never race out of order, but two different
+// motors (e.g. one seat driving, another running the forklift) fire fully
+// concurrently instead of waiting on each other's round trip.
+const commandQueues = {};
+for (const team of ['red', 'blue']) {
+  for (const role of ROLES) {
+    commandQueues[`${team}_${role}`] = Promise.resolve();
+  }
+}
 
-function sendCommand(team, text) {
-  // input() on the Brian side only returns once it sees a newline -- without
-  // one, commands from separate POSTs pile up in the same input() call.
-  const body = text + '\n';
-  commandQueues[team] = commandQueues[team].then(() =>
-    fetch(`/api/console/${team}`, {
+function sendCommand(team, role, text) {
+  const key = `${team}_${role}`;
+  commandQueues[key] = commandQueues[key].then(() =>
+    fetch(`/api/motor/${team}`, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
-      body,
+      body: text,
     }).catch(() => {})
   );
 }
@@ -98,7 +102,7 @@ window.addEventListener('keydown', (e) => {
   pressedKeys.add(key);
 
   const role = roleForSeat(mapping.team, mapping.seatIndex);
-  sendCommand(mapping.team, commandFor(role, mapping.dir));
+  sendCommand(mapping.team, role, commandFor(role, mapping.dir));
 
   const keyEl = document.getElementById(`key-${mapping.team}-${key}`);
   if (keyEl) keyEl.classList.add('pressed');
@@ -112,24 +116,32 @@ window.addEventListener('keyup', (e) => {
   pressedKeys.delete(key);
 
   const role = roleForSeat(mapping.team, mapping.seatIndex);
-  sendCommand(mapping.team, commandFor(role, 'Stop'));
+  sendCommand(mapping.team, role, commandFor(role, 'Stop'));
 
   const keyEl = document.getElementById(`key-${mapping.team}-${key}`);
   if (keyEl) keyEl.classList.remove('pressed');
 });
 
 // Safety net: if the browser window loses focus, release everything so a
-// motor never keeps "running" because a keyup was missed.
-window.addEventListener('blur', () => {
+// motor never keeps "running" because a keyup was missed. Both events are
+// wired to the same handler -- `blur` isn't 100% reliable for OS-level
+// alt-tab in every browser, `visibilitychange` covers tab/window hiding --
+// so between the two, losing focus any way it can happen is covered.
+function releaseAllKeys() {
   for (const key of Array.from(pressedKeys)) {
     const mapping = KEY_MAP[key];
     if (!mapping) continue;
     const role = roleForSeat(mapping.team, mapping.seatIndex);
-    sendCommand(mapping.team, commandFor(role, 'Stop'));
+    sendCommand(mapping.team, role, commandFor(role, 'Stop'));
     const keyEl = document.getElementById(`key-${mapping.team}-${key}`);
     if (keyEl) keyEl.classList.remove('pressed');
   }
   pressedKeys.clear();
+}
+
+window.addEventListener('blur', releaseAllKeys);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') releaseAllKeys();
 });
 
 // ---- Timer / role rotation ----
@@ -146,7 +158,7 @@ function renderTimer() {
 function stopAllMotors() {
   for (const team of ['red', 'blue']) {
     for (const role of ROLES) {
-      sendCommand(team, commandFor(role, 'Stop'));
+      sendCommand(team, role, commandFor(role, 'Stop'));
     }
   }
 }
